@@ -1,0 +1,244 @@
+/* Title:  Implementation of DC Motor Driving using Relays and Interrupts to the Smart Home System
+Author: Samkelo Mareka
+Date: 07/04/2026
+Student ID: 24004894
+*/
+
+#include "mbed.h"
+#include "arm_book_lib.h"
+#include "display.h" 
+
+// Hardware Pin Definitions 
+DigitalInOut motorM1(PF_2); 
+DigitalInOut motorM2(PE_3); 
+InterruptIn pirSensor(PG_0); 
+DigitalInOut buzzer(PE_10); 
+
+// Keypad Pin Definitions 
+DigitalOut keypadRows[4] = {DigitalOut(D2), DigitalOut(D3), DigitalOut(D4), DigitalOut(D5)};
+DigitalIn keypadCols[4] = {DigitalIn(D6, PullUp), DigitalIn(D7, PullUp), DigitalIn(D8, PullUp), DigitalIn(D9, PullUp)};
+
+const char keyMap[4][4] = {
+    {'1', '2', '3', 'A'},
+    {'4', '5', '6', 'B'},
+    {'7', '8', '9', 'C'},
+    {'*', '0', '#', 'D'}
+};
+
+// State Machine Definitions
+typedef enum {
+    GATE_CLOSED = 0,
+    GATE_OPENING = 1,
+    GATE_OPEN = 2,
+    GATE_CLOSING = 3
+} GateState_t;
+
+GateState_t gateState = GATE_CLOSED;
+
+// Volatile flags & Non-blocking timers
+volatile bool motionDetected = false;
+// Flags for asynchronous communication between the keypad scanner and the FSM
+bool openRequested = false;
+bool closeRequested = false;
+
+// Non-blocking counters
+int alarmTimer = 0; 
+int gateTimer = 0; 
+
+// Custom serial print function 
+void manualSerialPrint(const char* label, int num) {
+    char numStr[10];
+    int i = 0;
+    
+    if (num == 0) {
+        numStr[i++] = '0';
+    } else {
+        while (num > 0) {
+            numStr[i++] = (num % 10) + '0';
+            num /= 10;
+        }
+    }
+    
+    printf("%s: ", label);
+    for (int j = i - 1; j >= 0; j--) {    // Print array in reverse order
+        printf("%c", numStr[j]);
+    }
+    printf("\r\n");
+}
+
+// Interrupt Service Routines (ISRs)
+void pir_isr() {
+    motionDetected = true;
+}
+
+// Hardware Initialization
+void setupSystem() {
+    // Configured as OpenDrain to safely interface 3.3V pins with 5V external modules.
+    motorM1.mode(OpenDrain);
+    motorM2.mode(OpenDrain);
+    motorM1.input(); 
+    motorM2.input(); 
+    
+    buzzer.mode(OpenDrain);
+    buzzer.input(); 
+    
+    // Initialize keypad rows to HIGH
+    for(int i = 0; i < 4; i++) {
+        keypadRows[i] = 1; 
+    }
+}
+
+// Non-blocking Keypad Scanner
+char readKeypad() {
+    static bool wasKeyPressed = false; 
+    
+    for(int r = 0; r < 4; r++) {
+        keypadRows[r] = 0; // Pull row LOW
+        
+        // Let the physical voltage drop down the wire before reading!
+        delay(2); 
+        
+        for(int c = 0; c < 4; c++) {
+            if(keypadCols[c] == 0) {     // Circuit completed
+                delay(30); // Debounce to ignore mechanical switch bounce
+                if (!wasKeyPressed) {
+                    wasKeyPressed = true; 
+                    keypadRows[r] = 1; 
+                    return keyMap[r][c];
+                }
+                keypadRows[r] = 1;
+                return '\0'; 
+            }
+        }
+        keypadRows[r] = 1;     // Reset row HIGH before checking the next
+    }
+    
+    wasKeyPressed = false;     // Reset lock when all keys are released
+    return '\0'; 
+}
+
+// Non-Blocking FSM Function
+void motorUpdateFSM() {
+    switch(gateState) {
+        case GATE_CLOSED:
+            motorM1.input(); motorM2.input();     // Isolated relays
+            if (openRequested) {
+                gateState = GATE_OPENING;
+                openRequested = false;
+                
+                gateTimer = 200;     // Initializes non-blocking timer
+                
+                manualSerialPrint("Gate FSM State", GATE_OPENING);
+                displayCharPositionWrite(0, 0);
+                displayStringWrite("Gate: OPENING   ");    // Padded string clears old characters
+            }
+            break;
+            
+        case GATE_OPENING:
+            motorM1.output(); motorM1 = 0; 
+            motorM2.input();               
+            
+            if (gateTimer > 0) {
+                gateTimer--; 
+            } else {
+                gateState = GATE_OPEN;
+                manualSerialPrint("Gate FSM State", GATE_OPEN);
+                displayCharPositionWrite(0, 0);
+                displayStringWrite("Gate: OPEN      ");
+            }
+            break;
+            
+        case GATE_OPEN:
+            motorM1.input(); motorM2.input(); 
+            
+            if (closeRequested) {
+                gateState = GATE_CLOSING;
+                closeRequested = false;
+                
+                gateTimer = 200; 
+                
+                manualSerialPrint("Gate FSM State", GATE_CLOSING);
+                displayCharPositionWrite(0, 0);
+                displayStringWrite("Gate: CLOSING   ");
+            }
+            break;
+            
+        case GATE_CLOSING:
+            motorM1.input();                
+            motorM2.output(); motorM2 = 0;      // Reverse polarity trigger
+            
+            if (gateTimer > 0) {
+                gateTimer--; 
+            } else {
+                gateState = GATE_CLOSED;
+                manualSerialPrint("Gate FSM State", GATE_CLOSED);
+                displayCharPositionWrite(0, 0);
+                displayStringWrite("Gate: CLOSED    ");
+            }
+            break;
+    }
+}
+
+int main() {
+    setupSystem();
+    // Initialize specific I2C LCD hardware settings as required
+    displayInit(DISPLAY_TYPE_LCD_HD44780, DISPLAY_CONNECTION_I2C_PCF8574_IO_EXPANDER); 
+    
+    // Attach ISR to the rising edge of the PIR sensor pulse
+    pirSensor.rise(&pir_isr);
+    
+    printf("Smart Home System Initiated...\r\n");
+    manualSerialPrint("Initial Gate FSM State", GATE_CLOSED);
+    
+    displayCharPositionWrite(0, 0);
+    displayStringWrite("System Ready    ");
+
+    while (true) {
+        // 1. Read Inputs 
+        char key = readKeypad();
+        
+        // Strict command filtering provides fault tolerance against noise/ghost presses
+        if (key == 'A') { 
+            openRequested = true;
+            printf("Command: OPEN triggered via Keypad\r\n");
+        } 
+        else if (key == 'B') { 
+            closeRequested = true;
+            printf("Command: CLOSE triggered via Keypad\r\n");
+        }
+
+        // 2. Update Gate Logic 
+        motorUpdateFSM();
+        
+        // 3. Handle PIR Interrupt Flags
+        if (motionDetected) {
+            printf("ALARM: Intruder Detected via PIR!\r\n");
+            
+            displayCharPositionWrite(0, 0);
+            displayStringWrite("ALARM: INTRUDER!");
+            
+            buzzer.output(); 
+            buzzer = 0;     // Trigger alarm
+            
+            alarmTimer = 150;         // Initialize non-blocking countdown
+            motionDetected = false;   // Initialize non-blocking countdown
+        }
+        
+        // 4. Manage the Alarm Timer 
+        if (alarmTimer > 0) {
+            alarmTimer--; 
+            
+            if (alarmTimer == 0) { 
+                buzzer.input();     // Disable alarm
+                
+                displayCharPositionWrite(0, 0);
+                if(gateState == GATE_OPEN) displayStringWrite("Gate: OPEN      ");
+                else if(gateState == GATE_CLOSED) displayStringWrite("Gate: CLOSED    ");
+                else if(gateState == GATE_OPENING) displayStringWrite("Gate: OPENING   ");
+                else if(gateState == GATE_CLOSING) displayStringWrite("Gate: CLOSING   ");
+            }
+        }
+        
+        delay(10);  // Establishes loop frequency at approx. 100Hz (10ms per cycle)
+    }
+}
